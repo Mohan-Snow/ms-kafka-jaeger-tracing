@@ -1,0 +1,95 @@
+services:
+  # Infrastructure services
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.0.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+
+  kafka:
+    image: confluentinc/cp-kafka:7.0.0
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.29
+    ports:
+      - "6831:6831/udp"
+      - "6832:6832/udp"
+      - "5778:5778"
+      - "16686:16686"
+      - "14268:14268"
+      - "14250:14250"
+      - "9411:9411"
+
+  postgres:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: data_pipeline
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  # Microservices
+  producer-service:
+    build:
+      context: ./producer-service
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_BROKER: kafka:29092
+      JAEGER_AGENT_HOST: jaeger
+    depends_on:
+      - kafka
+      - jaeger
+
+  consumer-service:
+    build:
+      context: ./consumer-service
+      dockerfile: Dockerfile
+    ports:
+      - "8081:8081"
+    environment:
+      KAFKA_BROKER: kafka:29092
+      STORAGE_URL: http://storage:8082/store
+      JAEGER_AGENT_HOST: jaeger
+    depends_on:
+      - kafka
+      - jaeger
+      - storage-service
+
+  storage-service:
+    build:
+      context: ./storage-service
+      dockerfile: Dockerfile
+    ports:
+      - "8082:8082"
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: postgres
+      DB_PASSWORD: password
+      DB_NAME: data_pipeline
+      JAEGER_AGENT_HOST: jaeger
+    depends_on:
+      - postgres
+      - jaeger
+
+volumes:
+  postgres_data:
