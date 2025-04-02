@@ -1,27 +1,30 @@
 services:
-  # Infrastructure services
+
   zookeeper:
-    image: confluentinc/cp-zookeeper:7.0.0
+    image: confluentinc/cp-zookeeper:latest
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
     ports:
-      - "2181:2181"
+      - 2181:2181
+    networks:
+      - app-network
 
-  kafka:
-    image: confluentinc/cp-kafka:7.0.0
+  kafka-serv:
+    image: confluentinc/cp-kafka:latest
     depends_on:
       - zookeeper
     ports:
-      - "9092:9092"
+      - 29092:29092
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka-serv:9092,PLAINTEXT_HOST://kafka-serv:29092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    networks:
+      - app-network
 
   jaeger:
     image: jaegertracing/all-in-one:1.29
@@ -44,6 +47,8 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    networks:
+      - app-network
 
   # Microservices
   producer-service:
@@ -53,11 +58,13 @@ services:
     ports:
       - "8080:8080"
     environment:
-      KAFKA_BROKER: kafka:29092
+      KAFKA_BROKER: kafka-serv:29092
       JAEGER_AGENT_HOST: jaeger
     depends_on:
-      - kafka
+      - kafka-serv
       - jaeger
+    networks:
+      - app-network
 
   consumer-service:
     build:
@@ -66,13 +73,14 @@ services:
     ports:
       - "8081:8081"
     environment:
-      KAFKA_BROKER: kafka:29092
-      STORAGE_URL: http://storage:8082/store
+      KAFKA_BROKER: kafka-serv:29092
+      STORAGE_URL: "http://storage-service:8082/store"  # Use internal Docker DNS
       JAEGER_AGENT_HOST: jaeger
     depends_on:
-      - kafka
+      - kafka-serv
       - jaeger
-      - storage-service
+    networks:
+      - app-network
 
   storage-service:
     build:
@@ -81,15 +89,21 @@ services:
     ports:
       - "8082:8082"
     environment:
-      DB_HOST: postgres
-      DB_PORT: 5432
-      DB_USER: postgres
-      DB_PASSWORD: password
-      DB_NAME: data_pipeline
-      JAEGER_AGENT_HOST: jaeger
+      DB_HOST: "postgres"
+      DB_PORT: "5432"
+      DB_USER: "postgres"
+      DB_PASSWORD: "password"
+      DB_NAME: "data_pipeline"
+      JAEGER_AGENT_HOST: "jaeger"
     depends_on:
       - postgres
       - jaeger
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge
 
 volumes:
   postgres_data:
