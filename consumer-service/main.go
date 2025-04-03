@@ -25,6 +25,20 @@ var (
 	storageURL      = os.Getenv("STORAGE_URL")
 )
 
+func main() {
+	_, closer := initTracer("consumer-service")
+	defer closer()
+
+	go consumeFromKafka(context.Background())
+
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	log.Printf("Consumer service started on %s\n", consumerPort)
+	log.Fatal(http.ListenAndServe(consumerPort, nil))
+}
+
 func initTracer(serviceName string) (opentracing.Tracer, func()) {
 	cfg := jaegercfg.Configuration{
 		ServiceName: serviceName,
@@ -34,7 +48,7 @@ func initTracer(serviceName string) (opentracing.Tracer, func()) {
 		},
 		Reporter: &jaegercfg.ReporterConfig{
 			LogSpans:           true,
-			LocalAgentHostPort: "localhost:6831",
+			LocalAgentHostPort: "jaeger:6831",
 		},
 	}
 
@@ -47,9 +61,51 @@ func initTracer(serviceName string) (opentracing.Tracer, func()) {
 	return tracer, func() { closer.Close() }
 }
 
+func consumeFromKafka(ctx context.Context) {
+	reader := kafka.NewReader(kafka.ReaderConfig{
+		Brokers: []string{kafkaBroker},
+		Topic:   topic,
+		GroupID: consumerGroupID,
+	})
+
+	for {
+		msg, err := reader.ReadMessage(ctx)
+		if err != nil {
+			log.Printf("Error reading message: %v", err)
+			continue
+		}
+
+		// Extract tracing context from Kafka headers
+		headers := make(map[string]string)
+		for _, header := range msg.Headers {
+			headers[header.Key] = string(header.Value)
+		}
+
+		spanCtx, _ := opentracing.GlobalTracer().Extract(
+			opentracing.TextMap,
+			opentracing.TextMapCarrier(headers),
+		)
+		span := opentracing.StartSpan("processMessageFromKafka", ext.RPCServerOption(spanCtx))
+		ctx := opentracing.ContextWithSpan(context.Background(), span)
+
+		log.Printf("Received message: %s\n", string(msg.Value))
+
+		if err := forwardToStorage(ctx, msg.Value); err != nil {
+			log.Printf("Failed to forward message: %v", err)
+			ext.Error.Set(span, true)
+		}
+
+		span.Finish()
+	}
+}
+
 func forwardToStorage(ctx context.Context, data []byte) error {
-	span, ctx := opentracing.StartSpanFromContext(ctx, "forwardToStorage")
+	span, ctx := opentracing.StartSpanFromContext(ctx, "forwardToStorage  HTTP_POST /store")
 	defer span.Finish()
+
+	// Add tags
+	span.SetTag("http.method", "POST")
+	span.SetTag("http.url", "/store")
 
 	req, err := http.NewRequest("POST", storageURL, bytes.NewBuffer(data))
 	if err != nil {
@@ -83,56 +139,4 @@ func forwardToStorage(ctx context.Context, data []byte) error {
 	}
 
 	return nil
-}
-
-func consumeFromKafka(ctx context.Context) {
-	reader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers: []string{kafkaBroker},
-		Topic:   topic,
-		GroupID: consumerGroupID,
-	})
-
-	for {
-		msg, err := reader.ReadMessage(ctx)
-		if err != nil {
-			log.Printf("Error reading message: %v", err)
-			continue
-		}
-
-		// Extract tracing context from Kafka headers
-		headers := make(map[string]string)
-		for _, header := range msg.Headers {
-			headers[header.Key] = string(header.Value)
-		}
-
-		spanCtx, _ := opentracing.GlobalTracer().Extract(
-			opentracing.TextMap,
-			opentracing.TextMapCarrier(headers),
-		)
-		span := opentracing.StartSpan("processMessage", ext.RPCServerOption(spanCtx))
-		ctx := opentracing.ContextWithSpan(context.Background(), span)
-
-		log.Printf("Received message: %s\n", string(msg.Value))
-
-		if err := forwardToStorage(ctx, msg.Value); err != nil {
-			log.Printf("Failed to forward message: %v", err)
-			ext.Error.Set(span, true)
-		}
-
-		span.Finish()
-	}
-}
-
-func main() {
-	_, closer := initTracer("consumer-service")
-	defer closer()
-
-	go consumeFromKafka(context.Background())
-
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
-
-	log.Printf("Consumer service started on %s\n", consumerPort)
-	log.Fatal(http.ListenAndServe(consumerPort, nil))
 }

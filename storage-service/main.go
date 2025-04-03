@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"time"
@@ -31,26 +32,20 @@ type Data struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-func initTracer(serviceName string) (opentracing.Tracer, func()) {
-	cfg := jaegercfg.Configuration{
-		ServiceName: serviceName,
-		Sampler: &jaegercfg.SamplerConfig{
-			Type:  jaeger.SamplerTypeConst,
-			Param: 1,
-		},
-		Reporter: &jaegercfg.ReporterConfig{
-			LogSpans:           true,
-			LocalAgentHostPort: "localhost:6831",
-		},
-	}
+func main() {
+	_, closer := initTracer("storage-service")
+	defer closer()
 
-	tracer, closer, err := cfg.NewTracer()
-	if err != nil {
-		panic(err)
-	}
+	db := initDB()
+	defer db.Close()
 
-	opentracing.SetGlobalTracer(tracer)
-	return tracer, func() { closer.Close() }
+	http.HandleFunc("/store", storeDataHandler(db))
+	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	log.Printf("Storage service started on %s\n", storagePort)
+	log.Fatal(http.ListenAndServe(storagePort, nil))
 }
 
 func initDB() *sql.DB {
@@ -81,14 +76,44 @@ func initDB() *sql.DB {
 	return db
 }
 
+func initTracer(serviceName string) (opentracing.Tracer, func()) {
+	cfg := jaegercfg.Configuration{
+		ServiceName: serviceName,
+		Sampler: &jaegercfg.SamplerConfig{
+			Type:  jaeger.SamplerTypeConst,
+			Param: 1,
+		},
+		Reporter: &jaegercfg.ReporterConfig{
+			LogSpans:           true,
+			LocalAgentHostPort: "jaeger:6831",
+		},
+	}
+
+	tracer, closer, err := cfg.NewTracer()
+	if err != nil {
+		panic(err)
+	}
+
+	opentracing.SetGlobalTracer(tracer)
+	return tracer, func() { closer.Close() }
+}
+
 func storeDataHandler(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		spanCtx, _ := opentracing.GlobalTracer().Extract(
 			opentracing.HTTPHeaders,
 			opentracing.HTTPHeadersCarrier(r.Header),
 		)
-		span := opentracing.StartSpan("storeData", ext.RPCServerOption(spanCtx))
+		span := opentracing.StartSpan("storeDataToDatabase", ext.RPCServerOption(spanCtx))
 		defer span.Finish()
+
+		// Generate random delay between 1-5 seconds
+		delay := time.Duration(rand.Intn(4) + 1)
+		span.LogKV("event", "delay_start", "seconds", delay.Seconds())
+
+		// Wait for random duration
+		time.Sleep(delay)
+		span.LogKV("event", "delay_complete")
 
 		var data map[string]interface{}
 		if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
@@ -118,20 +143,4 @@ func storeDataHandler(db *sql.DB) http.HandlerFunc {
 		w.WriteHeader(http.StatusCreated)
 		w.Write([]byte("Data stored successfully"))
 	}
-}
-
-func main() {
-	_, closer := initTracer("storage-service")
-	defer closer()
-
-	db := initDB()
-	defer db.Close()
-
-	http.HandleFunc("/store", storeDataHandler(db))
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
-
-	log.Printf("Storage service started on %s\n", storagePort)
-	log.Fatal(http.ListenAndServe(storagePort, nil))
 }
