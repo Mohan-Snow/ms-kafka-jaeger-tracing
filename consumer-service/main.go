@@ -6,6 +6,7 @@ import (
 	_ "encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"time"
@@ -68,7 +69,16 @@ func consumeFromKafka(ctx context.Context) {
 		GroupID: consumerGroupID,
 	})
 
+	// Create local random generator (thread-safe)
+	newRand := rand.New(rand.NewSource(time.Now().UnixNano()))
+
 	for {
+		// Generate random sleep duration (5-10 seconds)
+		sleepDuration := time.Duration(newRand.Intn(3)+1) * time.Second
+
+		log.Printf("Sleeping during reading msg from Kafka for %v\n", sleepDuration)
+		time.Sleep(sleepDuration)
+
 		msg, err := reader.ReadMessage(ctx)
 		if err != nil {
 			log.Printf("Error reading message: %v", err)
@@ -125,7 +135,28 @@ func forwardToStorage(ctx context.Context, data []byte) error {
 	}
 
 	req = req.WithContext(ctx)
-	client := &http.Client{Timeout: 5 * time.Second}
+
+	client := &http.Client{
+		Timeout: 60 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:       10,
+			IdleConnTimeout:    30 * time.Second,
+			DisableCompression: true,
+		},
+	}
+
+	// Create local random generator (thread-safe)
+	newRand := rand.New(rand.NewSource(time.Now().UnixNano()))
+	// Generate random sleep duration (5-10 seconds)
+	sleepDuration := time.Duration(newRand.Intn(2)+1) * time.Second
+
+	span.LogKV("event", "delay_start", "seconds", sleepDuration)
+
+	log.Printf("Sleeping during request to storage-service for %v\n", sleepDuration)
+	time.Sleep(sleepDuration)
+
+	span.LogKV("event", "delay_complete")
+
 	resp, err := client.Do(req)
 	if err != nil {
 		ext.Error.Set(span, true)

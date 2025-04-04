@@ -107,12 +107,16 @@ func storeDataHandler(db *sql.DB) http.HandlerFunc {
 		span := opentracing.StartSpan("storeDataToDatabase", ext.RPCServerOption(spanCtx))
 		defer span.Finish()
 
-		// Generate random delay between 1-5 seconds
-		delay := time.Duration(rand.Intn(4) + 1)
-		span.LogKV("event", "delay_start", "seconds", delay.Seconds())
+		// Create local random generator (thread-safe)
+		newRand := rand.New(rand.NewSource(time.Now().UnixNano()))
+		// Generate random sleep duration (5-10 seconds)
+		sleepDuration := time.Duration(newRand.Intn(10)+5) * time.Second
 
-		// Wait for random duration
-		time.Sleep(delay)
+		span.LogKV("event", "delay_start", "seconds", sleepDuration)
+
+		log.Printf("Sleeping for %v\n", sleepDuration)
+		time.Sleep(sleepDuration)
+
 		span.LogKV("event", "delay_complete")
 
 		var data map[string]interface{}
