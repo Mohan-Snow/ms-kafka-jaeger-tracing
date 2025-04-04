@@ -1,4 +1,4 @@
-## Here is an investigation pet-project of Jaeger
+## Here is Jaeger investigation pet-project
 
 ### Base structure:
 
