@@ -1,11 +1,12 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
-	"math/rand"
 	"net/http"
 	"os"
 	"time"
@@ -13,6 +14,7 @@ import (
 	_ "github.com/lib/pq"
 	"github.com/opentracing/opentracing-go"
 	"github.com/opentracing/opentracing-go/ext"
+	jaegerlog "github.com/opentracing/opentracing-go/log"
 	"github.com/uber/jaeger-client-go"
 	jaegercfg "github.com/uber/jaeger-client-go/config"
 )
@@ -24,6 +26,7 @@ var (
 	dbPassword  = os.Getenv("DB_PASSWORD")
 	dbName      = os.Getenv("DB_NAME")
 	storagePort = ":8082"
+	serviceName = "storage-service"
 )
 
 type Data struct {
@@ -32,17 +35,19 @@ type Data struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
-func main() {
-	_, closer := initTracer("storage-service")
-	defer closer()
+var db *sql.DB
 
-	db := initDB()
+func main() {
+	_, closer, err := initTracer()
+	defer closer.Close()
+	if err != nil {
+		log.Fatalf("Could not initialize Jaeger tracer: %v", err)
+	}
+
+	db = initDB()
 	defer db.Close()
 
-	http.HandleFunc("/store", storeDataHandler(db))
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
+	http.HandleFunc("/store", handleRequest)
 
 	log.Printf("Storage service started on %s\n", storagePort)
 	log.Fatal(http.ListenAndServe(storagePort, nil))
@@ -76,7 +81,7 @@ func initDB() *sql.DB {
 	return db
 }
 
-func initTracer(serviceName string) (opentracing.Tracer, func()) {
+func initTracer() (opentracing.Tracer, io.Closer, error) {
 	cfg := jaegercfg.Configuration{
 		ServiceName: serviceName,
 		Sampler: &jaegercfg.SamplerConfig{
@@ -91,60 +96,83 @@ func initTracer(serviceName string) (opentracing.Tracer, func()) {
 
 	tracer, closer, err := cfg.NewTracer()
 	if err != nil {
-		panic(err)
+		return nil, nil, fmt.Errorf("could not initialize Jaeger tracer: %w", err)
 	}
 
 	opentracing.SetGlobalTracer(tracer)
-	return tracer, func() { closer.Close() }
+	return tracer, closer, nil
 }
 
-func storeDataHandler(db *sql.DB) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		spanCtx, _ := opentracing.GlobalTracer().Extract(
-			opentracing.HTTPHeaders,
-			opentracing.HTTPHeadersCarrier(r.Header),
-		)
-		span := opentracing.StartSpan("storeDataToDatabase", ext.RPCServerOption(spanCtx))
-		defer span.Finish()
+func handleRequest(w http.ResponseWriter, r *http.Request) {
+	spanCtx, _ := opentracing.GlobalTracer().Extract(
+		opentracing.HTTPHeaders,
+		opentracing.HTTPHeadersCarrier(r.Header),
+	)
 
-		// Create local random generator (thread-safe)
-		newRand := rand.New(rand.NewSource(time.Now().UnixNano()))
-		// Generate random sleep duration (5-10 seconds)
-		sleepDuration := time.Duration(newRand.Intn(10)+5) * time.Second
+	span := opentracing.StartSpan("handle_data_from_request", ext.RPCServerOption(spanCtx))
+	defer span.Finish()
 
-		span.LogKV("event", "delay_start", "seconds", sleepDuration)
+	// Создаем спан для отслеживания HTTP запроса
+	//span := opentracing.GlobalTracer().StartSpan("handle_data_from_request")
+	//defer span.Finish()
 
-		log.Printf("Sleeping for %v\n", sleepDuration)
-		time.Sleep(sleepDuration)
+	// Извлекаем контекст из запроса и привязываем его к текущему спану
+	span.SetTag("http.method", r.Method)
+	span.SetTag("http.url", r.URL.String())
 
-		span.LogKV("event", "delay_complete")
-
-		var data map[string]interface{}
-		if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			ext.Error.Set(span, true)
-			return
-		}
-
-		jsonData, err := json.Marshal(data)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			ext.Error.Set(span, true)
-			return
-		}
-
-		_, err = db.ExecContext(
-			opentracing.ContextWithSpan(r.Context(), span),
-			"INSERT INTO data (content) VALUES ($1)",
-			jsonData,
-		)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			ext.Error.Set(span, true)
-			return
-		}
-
-		w.WriteHeader(http.StatusCreated)
-		w.Write([]byte("Data stored successfully"))
+	var data map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		ext.Error.Set(span, true)
+		return
 	}
+
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		ext.Error.Set(span, true)
+		return
+	}
+
+	err = storeData(span.Context(), string(jsonData))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		ext.Error.Set(span, true)
+		return
+	}
+
+	w.WriteHeader(http.StatusCreated)
+	w.Write([]byte("Data stored successfully"))
+}
+
+func storeData(parentCtx opentracing.SpanContext, data string) error {
+	// Создаем спан для операции сохранения в базе данных
+	span := opentracing.GlobalTracer().StartSpan("save_data_to_database", opentracing.ChildOf(parentCtx))
+	defer span.Finish()
+
+	// Создаем новый span как дочерний для parentCtx
+	//span := opentracing.StartSpan(
+	//	"store_data",
+	//	opentracing.ChildOf(parentCtx),
+	//	opentracing.Tag{Key: string(ext.Component), Value: "db"},
+	//)
+	//defer span.Finish()
+
+	// Получаем контекст с информацией о span
+	ctx := opentracing.ContextWithSpan(context.Background(), span)
+
+	// Выполняем SQL запрос с трассировкой
+	span.LogFields(
+		jaegerlog.String("query", "INSERT INTO data"),
+		jaegerlog.String("data", data),
+	)
+
+	_, err := db.ExecContext(ctx, "INSERT INTO data (content) VALUES ($1)", data)
+	if err != nil {
+		span.LogFields(jaegerlog.Error(err))
+		ext.Error.Set(span, true)
+		return err
+	}
+
+	return nil
 }

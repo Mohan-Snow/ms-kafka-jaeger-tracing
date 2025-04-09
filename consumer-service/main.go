@@ -5,16 +5,18 @@ import (
 	"context"
 	_ "encoding/json"
 	"fmt"
+	"io"
 	"log"
-	"math/rand"
 	"net/http"
 	"os"
 	"time"
 
 	"github.com/opentracing/opentracing-go"
 	"github.com/opentracing/opentracing-go/ext"
+	jaegerlog "github.com/opentracing/opentracing-go/log"
 	"github.com/segmentio/kafka-go"
 	"github.com/uber/jaeger-client-go"
+
 	jaegercfg "github.com/uber/jaeger-client-go/config"
 )
 
@@ -24,23 +26,24 @@ var (
 	consumerGroupID = "consumer-group"
 	consumerPort    = ":8081"
 	storageURL      = os.Getenv("STORAGE_URL")
+	serviceName     = "consumer-service"
 )
 
 func main() {
-	_, closer := initTracer("consumer-service")
-	defer closer()
+	_, closer, err := initTracer()
+	defer closer.Close()
+	if err != nil {
+		log.Fatalf("Could not initialize Jaeger tracer: %v", err)
+	}
 
 	go consumeFromKafka(context.Background())
-
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	})
 
 	log.Printf("Consumer service started on %s\n", consumerPort)
 	log.Fatal(http.ListenAndServe(consumerPort, nil))
 }
 
-func initTracer(serviceName string) (opentracing.Tracer, func()) {
+// Функция для настройки Jaeger клиента
+func initTracer() (opentracing.Tracer, io.Closer, error) {
 	cfg := jaegercfg.Configuration{
 		ServiceName: serviceName,
 		Sampler: &jaegercfg.SamplerConfig{
@@ -55,11 +58,11 @@ func initTracer(serviceName string) (opentracing.Tracer, func()) {
 
 	tracer, closer, err := cfg.NewTracer()
 	if err != nil {
-		panic(err)
+		return nil, nil, fmt.Errorf("could not initialize Jaeger tracer: %w", err)
 	}
 
 	opentracing.SetGlobalTracer(tracer)
-	return tracer, func() { closer.Close() }
+	return tracer, closer, nil
 }
 
 func consumeFromKafka(ctx context.Context) {
@@ -68,19 +71,12 @@ func consumeFromKafka(ctx context.Context) {
 		Topic:   topic,
 		GroupID: consumerGroupID,
 	})
-
-	// Create local random generator (thread-safe)
-	newRand := rand.New(rand.NewSource(time.Now().UnixNano()))
+	defer reader.Close()
 
 	for {
-		// Generate random sleep duration (5-10 seconds)
-		sleepDuration := time.Duration(newRand.Intn(3)+1) * time.Second
-
-		log.Printf("Sleeping during reading msg from Kafka for %v\n", sleepDuration)
-		time.Sleep(sleepDuration)
-
 		msg, err := reader.ReadMessage(ctx)
 		if err != nil {
+			jaegerlog.Error(err)
 			log.Printf("Error reading message: %v", err)
 			continue
 		}
@@ -91,14 +87,39 @@ func consumeFromKafka(ctx context.Context) {
 			headers[header.Key] = string(header.Value)
 		}
 
-		spanCtx, _ := opentracing.GlobalTracer().Extract(
-			opentracing.TextMap,
-			opentracing.TextMapCarrier(headers),
-		)
-		span := opentracing.StartSpan("processMessageFromKafka", ext.RPCServerOption(spanCtx))
-		ctx := opentracing.ContextWithSpan(context.Background(), span)
+		// Извлечение контекста трассировки из Kafka сообщения
+		// Создаем Carrier для извлечения контекста из сообщения
+		carrier := opentracing.TextMapCarrier(headers)
+		if err != nil {
+			jaegerlog.Error(err)
+			log.Printf("Failed to extract span context: %v", err)
+			continue
+		}
 
+		// Извлечение контекста из carrier
+		spanContext, err := opentracing.GlobalTracer().Extract(
+			opentracing.TextMap,
+			carrier,
+		)
+		if err != nil {
+			log.Printf("Failed to extract span context: %v", err)
+			continue
+		}
+
+		// Восстановление контекста и создание нового спана
+		span := opentracing.GlobalTracer().StartSpan("process_kafka_message", opentracing.ChildOf(spanContext))
+		defer span.Finish()
+
+		// Добавляем лог для демонстрации
+		span.LogFields(
+			jaegerlog.String("event", "message_received"),
+			jaegerlog.String("message", string(msg.Value)),
+		)
+
+		// Обработка сообщения
 		log.Printf("Received message: %s\n", string(msg.Value))
+
+		ctx := opentracing.ContextWithSpan(context.Background(), span)
 
 		if err := forwardToStorage(ctx, msg.Value); err != nil {
 			log.Printf("Failed to forward message: %v", err)
@@ -144,18 +165,6 @@ func forwardToStorage(ctx context.Context, data []byte) error {
 			DisableCompression: true,
 		},
 	}
-
-	// Create local random generator (thread-safe)
-	newRand := rand.New(rand.NewSource(time.Now().UnixNano()))
-	// Generate random sleep duration (5-10 seconds)
-	sleepDuration := time.Duration(newRand.Intn(2)+1) * time.Second
-
-	span.LogKV("event", "delay_start", "seconds", sleepDuration)
-
-	log.Printf("Sleeping during request to storage-service for %v\n", sleepDuration)
-	time.Sleep(sleepDuration)
-
-	span.LogKV("event", "delay_complete")
 
 	resp, err := client.Do(req)
 	if err != nil {

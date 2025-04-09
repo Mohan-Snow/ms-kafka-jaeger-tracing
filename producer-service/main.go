@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -18,6 +20,7 @@ import (
 var (
 	kafkaBroker = os.Getenv("KAFKA_BROKER")
 	topic       = "data-pipeline"
+	serviceName = "producer-service"
 )
 
 type kafkaHeadersWriter struct {
@@ -25,8 +28,11 @@ type kafkaHeadersWriter struct {
 }
 
 func main() {
-	_, closer := initTracer("producer-service")
-	defer closer()
+	_, closer, err := initTracer()
+	defer closer.Close()
+	if err != nil {
+		log.Fatalf("Could not initialize Jaeger tracer: %v", err)
+	}
 
 	http.HandleFunc("/data", handleRequest)
 
@@ -34,7 +40,8 @@ func main() {
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
-func initTracer(serviceName string) (opentracing.Tracer, func()) {
+// Функция для настройки Jaeger клиента
+func initTracer() (opentracing.Tracer, io.Closer, error) {
 	cfg := jaegercfg.Configuration{
 		ServiceName: serviceName,
 		Sampler: &jaegercfg.SamplerConfig{
@@ -49,11 +56,11 @@ func initTracer(serviceName string) (opentracing.Tracer, func()) {
 
 	tracer, closer, err := cfg.NewTracer()
 	if err != nil {
-		panic(err)
+		return nil, nil, fmt.Errorf("could not initialize Jaeger tracer: %w", err)
 	}
 
 	opentracing.SetGlobalTracer(tracer)
-	return tracer, func() { closer.Close() }
+	return tracer, closer, nil
 }
 
 func handleRequest(w http.ResponseWriter, r *http.Request) {
@@ -62,18 +69,15 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 		opentracing.HTTPHeadersCarrier(r.Header),
 	)
 
-	// Create root span
-	span := opentracing.StartSpan("handleRequest HTTP_POST /data", ext.RPCServerOption(spanCtx))
+	span := opentracing.StartSpan("handle_data_from_request", ext.RPCServerOption(spanCtx))
 	defer span.Finish()
+
+	// Create child spans
+	ctx := opentracing.ContextWithSpan(r.Context(), span)
 
 	// Add tags
 	span.SetTag("http.method", "POST")
 	span.SetTag("http.url", "/data")
-
-	// Create child spans
-	ctx := opentracing.ContextWithSpan(r.Context(), span)
-	processSpan, _ := opentracing.StartSpanFromContext(ctx, "process_data")
-	defer processSpan.Finish()
 
 	var data map[string]interface{}
 	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
@@ -99,15 +103,21 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("Data accepted and sent to Kafka"))
 }
 
+// Функция для отправки данных в Kafka
 func produceToKafka(ctx context.Context, data []byte) error {
-	span, _ := opentracing.StartSpanFromContext(ctx, "produceToKafka")
-	defer span.Finish()
-
+	// Kafka writer with tracing instrumentation
 	writer := &kafka.Writer{
 		Addr:     kafka.TCP(kafkaBroker),
 		Topic:    topic,
 		Balancer: &kafka.LeastBytes{},
+		Transport: &kafka.Transport{
+			ClientID: "producer-service",
+		},
 	}
+	defer writer.Close()
+
+	span, _ := opentracing.StartSpanFromContext(ctx, "produce_to_kafka")
+	defer span.Finish()
 
 	headers := make([]kafka.Header, 0)
 
