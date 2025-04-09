@@ -5,18 +5,21 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
 	"time"
 
 	_ "github.com/lib/pq"
-	"github.com/opentracing/opentracing-go"
-	"github.com/opentracing/opentracing-go/ext"
-	jaegerlog "github.com/opentracing/opentracing-go/log"
-	"github.com/uber/jaeger-client-go"
-	jaegercfg "github.com/uber/jaeger-client-go/config"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/exporters/jaeger"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/resource"
+	tracesdk "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
+	"go.opentelemetry.io/otel/trace"
 )
 
 var (
@@ -27,6 +30,7 @@ var (
 	dbName      = os.Getenv("DB_NAME")
 	storagePort = ":8082"
 	serviceName = "storage-service"
+	tracer      = otel.Tracer("storage-service")
 )
 
 type Data struct {
@@ -38,11 +42,15 @@ type Data struct {
 var db *sql.DB
 
 func main() {
-	_, closer, err := initTracer()
-	defer closer.Close()
+	tracerProvider, err := initTracer()
 	if err != nil {
 		log.Fatalf("Could not initialize Jaeger tracer: %v", err)
 	}
+	defer func() {
+		if err := tracerProvider.Shutdown(context.Background()); err != nil {
+			log.Printf("Error shutting down tracer provider: %v", err)
+		}
+	}()
 
 	db = initDB()
 	defer db.Close()
@@ -81,63 +89,61 @@ func initDB() *sql.DB {
 	return db
 }
 
-func initTracer() (opentracing.Tracer, io.Closer, error) {
-	cfg := jaegercfg.Configuration{
-		ServiceName: serviceName,
-		Sampler: &jaegercfg.SamplerConfig{
-			Type:  jaeger.SamplerTypeConst,
-			Param: 1,
-		},
-		Reporter: &jaegercfg.ReporterConfig{
-			LogSpans:           true,
-			LocalAgentHostPort: "jaeger:6831",
-		},
-	}
-
-	tracer, closer, err := cfg.NewTracer()
+func initTracer() (*tracesdk.TracerProvider, error) {
+	exp, err := jaeger.New(jaeger.WithCollectorEndpoint(jaeger.WithEndpoint("http://jaeger:14268/api/traces")))
 	if err != nil {
-		return nil, nil, fmt.Errorf("could not initialize Jaeger tracer: %w", err)
+		return nil, fmt.Errorf("failed to create Jaeger exporter: %w", err)
 	}
 
-	opentracing.SetGlobalTracer(tracer)
-	return tracer, closer, nil
+	tracerProvider := tracesdk.NewTracerProvider(
+		tracesdk.WithBatcher(exp),
+		tracesdk.WithResource(resource.NewWithAttributes(
+			semconv.SchemaURL,
+			semconv.ServiceName(serviceName),
+			attribute.String("environment", "production"),
+		)),
+		tracesdk.WithSampler(tracesdk.AlwaysSample()),
+	)
+
+	otel.SetTracerProvider(tracerProvider)
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	))
+
+	return tracerProvider, nil
 }
 
 func handleRequest(w http.ResponseWriter, r *http.Request) {
-	spanCtx, _ := opentracing.GlobalTracer().Extract(
-		opentracing.HTTPHeaders,
-		opentracing.HTTPHeadersCarrier(r.Header),
-	)
-
-	span := opentracing.StartSpan("handle_data_from_request", ext.RPCServerOption(spanCtx))
-	defer span.Finish()
-
-	// Создаем спан для отслеживания HTTP запроса
-	//span := opentracing.GlobalTracer().StartSpan("handle_data_from_request")
-	//defer span.Finish()
-
-	// Извлекаем контекст из запроса и привязываем его к текущему спану
-	span.SetTag("http.method", r.Method)
-	span.SetTag("http.url", r.URL.String())
+	ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+	ctx, span := tracer.Start(ctx, "handle_data_from_request",
+		trace.WithAttributes(
+			attribute.String("http.method", r.Method),
+			attribute.String("http.url", r.URL.String()),
+		))
+	defer span.End()
 
 	var data map[string]interface{}
 	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
-		ext.Error.Set(span, true)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return
 	}
 
 	jsonData, err := json.Marshal(data)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
-		ext.Error.Set(span, true)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return
 	}
 
-	err = storeData(span.Context(), string(jsonData))
+	err = storeData(ctx, string(jsonData))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
-		ext.Error.Set(span, true)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return
 	}
 
@@ -145,32 +151,23 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("Data stored successfully"))
 }
 
-func storeData(parentCtx opentracing.SpanContext, data string) error {
-	// Создаем спан для операции сохранения в базе данных
-	span := opentracing.GlobalTracer().StartSpan("save_data_to_database", opentracing.ChildOf(parentCtx))
-	defer span.Finish()
+func storeData(ctx context.Context, data string) error {
+	ctx, span := tracer.Start(ctx, "save_data_to_database",
+		trace.WithAttributes(
+			attribute.String("component", "db"),
+		))
+	defer span.End()
 
-	// Создаем новый span как дочерний для parentCtx
-	//span := opentracing.StartSpan(
-	//	"store_data",
-	//	opentracing.ChildOf(parentCtx),
-	//	opentracing.Tag{Key: string(ext.Component), Value: "db"},
-	//)
-	//defer span.Finish()
-
-	// Получаем контекст с информацией о span
-	ctx := opentracing.ContextWithSpan(context.Background(), span)
-
-	// Выполняем SQL запрос с трассировкой
-	span.LogFields(
-		jaegerlog.String("query", "INSERT INTO data"),
-		jaegerlog.String("data", data),
-	)
+	span.AddEvent("Executing SQL query",
+		trace.WithAttributes(
+			attribute.String("query", "INSERT INTO data (content) VALUES ($1)"),
+			attribute.String("data", data),
+		))
 
 	_, err := db.ExecContext(ctx, "INSERT INTO data (content) VALUES ($1)", data)
 	if err != nil {
-		span.LogFields(jaegerlog.Error(err))
-		ext.Error.Set(span, true)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return err
 	}
 

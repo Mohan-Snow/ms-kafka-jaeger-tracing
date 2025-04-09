@@ -3,21 +3,22 @@ package main
 import (
 	"bytes"
 	"context"
-	_ "encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
 	"time"
 
-	"github.com/opentracing/opentracing-go"
-	"github.com/opentracing/opentracing-go/ext"
-	jaegerlog "github.com/opentracing/opentracing-go/log"
 	"github.com/segmentio/kafka-go"
-	"github.com/uber/jaeger-client-go"
-
-	jaegercfg "github.com/uber/jaeger-client-go/config"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/exporters/jaeger"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/resource"
+	tracesdk "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
+	"go.opentelemetry.io/otel/trace"
 )
 
 var (
@@ -27,14 +28,19 @@ var (
 	consumerPort    = ":8081"
 	storageURL      = os.Getenv("STORAGE_URL")
 	serviceName     = "consumer-service"
+	tracer          = otel.Tracer("consumer-service")
 )
 
 func main() {
-	_, closer, err := initTracer()
-	defer closer.Close()
+	tracerProvider, err := initTracer()
 	if err != nil {
 		log.Fatalf("Could not initialize Jaeger tracer: %v", err)
 	}
+	defer func() {
+		if err := tracerProvider.Shutdown(context.Background()); err != nil {
+			log.Printf("Error shutting down tracer provider: %v", err)
+		}
+	}()
 
 	go consumeFromKafka(context.Background())
 
@@ -42,27 +48,29 @@ func main() {
 	log.Fatal(http.ListenAndServe(consumerPort, nil))
 }
 
-// Функция для настройки Jaeger клиента
-func initTracer() (opentracing.Tracer, io.Closer, error) {
-	cfg := jaegercfg.Configuration{
-		ServiceName: serviceName,
-		Sampler: &jaegercfg.SamplerConfig{
-			Type:  jaeger.SamplerTypeConst,
-			Param: 1,
-		},
-		Reporter: &jaegercfg.ReporterConfig{
-			LogSpans:           true,
-			LocalAgentHostPort: "jaeger:6831",
-		},
-	}
-
-	tracer, closer, err := cfg.NewTracer()
+func initTracer() (*tracesdk.TracerProvider, error) {
+	exp, err := jaeger.New(jaeger.WithCollectorEndpoint(jaeger.WithEndpoint("http://jaeger:14268/api/traces")))
 	if err != nil {
-		return nil, nil, fmt.Errorf("could not initialize Jaeger tracer: %w", err)
+		return nil, fmt.Errorf("failed to create Jaeger exporter: %w", err)
 	}
 
-	opentracing.SetGlobalTracer(tracer)
-	return tracer, closer, nil
+	tracerProvider := tracesdk.NewTracerProvider(
+		tracesdk.WithBatcher(exp),
+		tracesdk.WithResource(resource.NewWithAttributes(
+			semconv.SchemaURL,
+			semconv.ServiceName(serviceName),
+			attribute.String("environment", "production"),
+		)),
+		tracesdk.WithSampler(tracesdk.AlwaysSample()),
+	)
+
+	otel.SetTracerProvider(tracerProvider)
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	))
+
+	return tracerProvider, nil
 }
 
 func consumeFromKafka(ctx context.Context) {
@@ -76,84 +84,63 @@ func consumeFromKafka(ctx context.Context) {
 	for {
 		msg, err := reader.ReadMessage(ctx)
 		if err != nil {
-			jaegerlog.Error(err)
 			log.Printf("Error reading message: %v", err)
 			continue
 		}
 
 		// Extract tracing context from Kafka headers
-		headers := make(map[string]string)
+		carrier := make(propagation.MapCarrier)
 		for _, header := range msg.Headers {
-			headers[header.Key] = string(header.Value)
+			carrier[header.Key] = string(header.Value)
 		}
 
-		// Извлечение контекста трассировки из Kafka сообщения
-		// Создаем Carrier для извлечения контекста из сообщения
-		carrier := opentracing.TextMapCarrier(headers)
-		if err != nil {
-			jaegerlog.Error(err)
-			log.Printf("Failed to extract span context: %v", err)
-			continue
-		}
+		// Extract the context from the carrier
+		ctx := otel.GetTextMapPropagator().Extract(context.Background(), carrier)
 
-		// Извлечение контекста из carrier
-		spanContext, err := opentracing.GlobalTracer().Extract(
-			opentracing.TextMap,
-			carrier,
-		)
-		if err != nil {
-			log.Printf("Failed to extract span context: %v", err)
-			continue
-		}
-
-		// Восстановление контекста и создание нового спана
-		span := opentracing.GlobalTracer().StartSpan("process_kafka_message", opentracing.ChildOf(spanContext))
-		defer span.Finish()
-
-		// Добавляем лог для демонстрации
-		span.LogFields(
-			jaegerlog.String("event", "message_received"),
-			jaegerlog.String("message", string(msg.Value)),
+		// Start a new span as a child of the extracted context
+		ctx, span := tracer.Start(ctx, "process_kafka_message",
+			trace.WithAttributes(
+				attribute.String("kafka.topic", topic),
+				attribute.String("kafka.group_id", consumerGroupID),
+			),
 		)
 
-		// Обработка сообщения
+		// Log message details
+		span.AddEvent("message_received",
+			trace.WithAttributes(
+				attribute.String("message", string(msg.Value)),
+			),
+		)
+
 		log.Printf("Received message: %s\n", string(msg.Value))
-
-		ctx := opentracing.ContextWithSpan(context.Background(), span)
 
 		if err := forwardToStorage(ctx, msg.Value); err != nil {
 			log.Printf("Failed to forward message: %v", err)
-			ext.Error.Set(span, true)
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
 		}
 
-		span.Finish()
+		span.End()
 	}
 }
 
 func forwardToStorage(ctx context.Context, data []byte) error {
-	span, ctx := opentracing.StartSpanFromContext(ctx, "forwardToStorage  HTTP_POST /store")
-	defer span.Finish()
-
-	// Add tags
-	span.SetTag("http.method", "POST")
-	span.SetTag("http.url", "/store")
+	ctx, span := tracer.Start(ctx, "forwardToStorage HTTP_POST /store",
+		trace.WithAttributes(
+			attribute.String("http.method", "POST"),
+			attribute.String("http.url", storageURL),
+		))
+	defer span.End()
 
 	req, err := http.NewRequest("POST", storageURL, bytes.NewBuffer(data))
 	if err != nil {
-		ext.Error.Set(span, true)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return err
 	}
 
 	// Inject tracing context into HTTP headers
-	err = opentracing.GlobalTracer().Inject(
-		span.Context(),
-		opentracing.HTTPHeaders,
-		opentracing.HTTPHeadersCarrier(req.Header),
-	)
-	if err != nil {
-		ext.Error.Set(span, true)
-		return err
-	}
+	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(req.Header))
 
 	req = req.WithContext(ctx)
 
@@ -168,14 +155,17 @@ func forwardToStorage(ctx context.Context, data []byte) error {
 
 	resp, err := client.Do(req)
 	if err != nil {
-		ext.Error.Set(span, true)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
 		return err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		ext.Error.Set(span, true)
-		return fmt.Errorf("storage service returned status: %d", resp.StatusCode)
+		err := fmt.Errorf("storage service returned status: %d", resp.StatusCode)
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return err
 	}
 
 	return nil

@@ -4,35 +4,47 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
-	_ "time"
 
-	"github.com/opentracing/opentracing-go"
-	"github.com/opentracing/opentracing-go/ext"
 	"github.com/segmentio/kafka-go"
-	"github.com/uber/jaeger-client-go"
-	jaegercfg "github.com/uber/jaeger-client-go/config"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	otelcodes "go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/exporters/jaeger"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/resource"
+	tracesdk "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
+	"go.opentelemetry.io/otel/trace"
 )
 
 var (
 	kafkaBroker = os.Getenv("KAFKA_BROKER")
 	topic       = "data-pipeline"
 	serviceName = "producer-service"
+	tracer      = otel.Tracer("producer-service")
 )
 
-type kafkaHeadersWriter struct {
-	headers *[]kafka.Header
+// KafkaHeaderCarrier adapts kafka.Message headers for OpenTelemetry propagation
+type KafkaHeaderCarrier struct {
+	Headers *[]kafka.Header
 }
 
+// Ensure KafkaHeaderCarrier implements the TextMapCarrier interface
+var _ propagation.TextMapCarrier = (*KafkaHeaderCarrier)(nil)
+
 func main() {
-	_, closer, err := initTracer()
-	defer closer.Close()
+	tracerProvider, err := initTracer()
 	if err != nil {
 		log.Fatalf("Could not initialize Jaeger tracer: %v", err)
 	}
+	defer func() {
+		if err := tracerProvider.Shutdown(context.Background()); err != nil {
+			log.Printf("Error shutting down tracer provider: %v", err)
+		}
+	}()
 
 	http.HandleFunc("/data", handleRequest)
 
@@ -40,62 +52,64 @@ func main() {
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
-// Функция для настройки Jaeger клиента
-func initTracer() (opentracing.Tracer, io.Closer, error) {
-	cfg := jaegercfg.Configuration{
-		ServiceName: serviceName,
-		Sampler: &jaegercfg.SamplerConfig{
-			Type:  jaeger.SamplerTypeConst,
-			Param: 1,
-		},
-		Reporter: &jaegercfg.ReporterConfig{
-			LogSpans:           true,
-			LocalAgentHostPort: "jaeger:6831",
-		},
-	}
-
-	tracer, closer, err := cfg.NewTracer()
+func initTracer() (*tracesdk.TracerProvider, error) {
+	// Create the Jaeger exporter
+	exp, err := jaeger.New(jaeger.WithCollectorEndpoint(jaeger.WithEndpoint("http://jaeger:14268/api/traces")))
 	if err != nil {
-		return nil, nil, fmt.Errorf("could not initialize Jaeger tracer: %w", err)
+		return nil, fmt.Errorf("failed to create Jaeger exporter: %w", err)
 	}
 
-	opentracing.SetGlobalTracer(tracer)
-	return tracer, closer, nil
+	tracerProvider := tracesdk.NewTracerProvider(
+		// Always be sure to batch in production
+		tracesdk.WithBatcher(exp),
+		// Record information about this application in a Resource
+		tracesdk.WithResource(resource.NewWithAttributes(
+			semconv.SchemaURL,
+			semconv.ServiceName(serviceName),
+			attribute.String("environment", "test"),
+		)),
+		// Sample all traces for demo purposes
+		tracesdk.WithSampler(tracesdk.AlwaysSample()),
+	)
+
+	otel.SetTracerProvider(tracerProvider)
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	))
+
+	return tracerProvider, nil
 }
 
 func handleRequest(w http.ResponseWriter, r *http.Request) {
-	spanCtx, _ := opentracing.GlobalTracer().Extract(
-		opentracing.HTTPHeaders,
-		opentracing.HTTPHeadersCarrier(r.Header),
-	)
-
-	span := opentracing.StartSpan("handle_data_from_request", ext.RPCServerOption(spanCtx))
-	defer span.Finish()
-
-	// Create child spans
-	ctx := opentracing.ContextWithSpan(r.Context(), span)
-
-	// Add tags
-	span.SetTag("http.method", "POST")
-	span.SetTag("http.url", "/data")
+	ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+	ctx, span := tracer.Start(ctx, "handle_data_from_request",
+		trace.WithAttributes(
+			attribute.String("http.method", r.Method),
+			attribute.String("http.url", r.URL.Path),
+		))
+	defer span.End()
 
 	var data map[string]interface{}
 	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
-		ext.Error.Set(span, true)
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, err.Error())
 		return
 	}
 
 	jsonData, err := json.Marshal(data)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
-		ext.Error.Set(span, true)
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, err.Error())
 		return
 	}
 
 	if err := produceToKafka(ctx, jsonData); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
-		ext.Error.Set(span, true)
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, err.Error())
 		return
 	}
 
@@ -103,9 +117,7 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("Data accepted and sent to Kafka"))
 }
 
-// Функция для отправки данных в Kafka
 func produceToKafka(ctx context.Context, data []byte) error {
-	// Kafka writer with tracing instrumentation
 	writer := &kafka.Writer{
 		Addr:     kafka.TCP(kafkaBroker),
 		Topic:    topic,
@@ -116,37 +128,60 @@ func produceToKafka(ctx context.Context, data []byte) error {
 	}
 	defer writer.Close()
 
-	span, _ := opentracing.StartSpanFromContext(ctx, "produce_to_kafka")
-	defer span.Finish()
+	ctx, span := tracer.Start(ctx, "produce_to_kafka")
+	defer span.End()
 
 	headers := make([]kafka.Header, 0)
+	carrier := KafkaHeaderCarrier{&headers}
 
 	// Inject tracing context into Kafka headers
-	err := opentracing.GlobalTracer().Inject(
-		span.Context(),
-		opentracing.TextMap,
-		kafkaHeadersWriter{&headers},
-	)
-	if err != nil {
-		return err
-	}
+	otel.GetTextMapPropagator().Inject(ctx, &carrier)
 
-	err = writer.WriteMessages(ctx, kafka.Message{
+	err := writer.WriteMessages(ctx, kafka.Message{
 		Headers: headers,
 		Value:   data,
 	})
 
 	if err != nil {
-		ext.Error.Set(span, true)
+		span.RecordError(err)
+		span.SetStatus(otelcodes.Error, err.Error())
 		return err
 	}
 
 	return nil
 }
 
-func (w kafkaHeadersWriter) Set(key, val string) {
-	*w.headers = append(*w.headers, kafka.Header{
+// Get returns the value associated with the passed key.
+func (c *KafkaHeaderCarrier) Get(key string) string {
+	for _, h := range *c.Headers {
+		if h.Key == key {
+			return string(h.Value)
+		}
+	}
+	return ""
+}
+
+// Set stores the key-value pair.
+func (c *KafkaHeaderCarrier) Set(key, value string) {
+	// Check if key exists and replace
+	for i, h := range *c.Headers {
+		if h.Key == key {
+			(*c.Headers)[i].Value = []byte(value)
+			return
+		}
+	}
+	// Otherwise, append new
+	*c.Headers = append(*c.Headers, kafka.Header{
 		Key:   key,
-		Value: []byte(val),
+		Value: []byte(value),
 	})
+}
+
+// Keys lists the keys stored in this carrier.
+func (c *KafkaHeaderCarrier) Keys() []string {
+	keys := make([]string, len(*c.Headers))
+	for i, h := range *c.Headers {
+		keys[i] = h.Key
+	}
+	return keys
 }
