@@ -4,6 +4,7 @@ go 1.24
 
 require (
 	github.com/segmentio/kafka-go v0.4.47
+	go.opentelemetry.io/contrib/propagators/jaeger v1.35.0
 	go.opentelemetry.io/otel v1.35.0
 	go.opentelemetry.io/otel/exporters/jaeger v1.17.0
 	go.opentelemetry.io/otel/sdk v1.35.0

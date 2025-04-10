@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/segmentio/kafka-go"
+	jaegerPropogator "go.opentelemetry.io/contrib/propagators/jaeger"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -49,26 +50,26 @@ func main() {
 }
 
 func initTracer() (*tracesdk.TracerProvider, error) {
+	// Create the Jaeger exporter
 	exp, err := jaeger.New(jaeger.WithCollectorEndpoint(jaeger.WithEndpoint("http://jaeger:14268/api/traces")))
 	if err != nil {
-		return nil, fmt.Errorf("failed to create Jaeger exporter: %w", err)
+		return nil, err
 	}
 
+	otel.SetTextMapPropagator(jaegerPropogator.Jaeger{})
+
 	tracerProvider := tracesdk.NewTracerProvider(
+		// Always be sure to batch in production.
 		tracesdk.WithBatcher(exp),
+		// Record information about this application in a Resource.
 		tracesdk.WithResource(resource.NewWithAttributes(
 			semconv.SchemaURL,
-			semconv.ServiceName(serviceName),
-			attribute.String("environment", "production"),
+			semconv.ServiceNameKey.String(serviceName),
 		)),
 		tracesdk.WithSampler(tracesdk.AlwaysSample()),
 	)
 
 	otel.SetTracerProvider(tracerProvider)
-	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
-		propagation.TraceContext{},
-		propagation.Baggage{},
-	))
 
 	return tracerProvider, nil
 }
